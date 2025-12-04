@@ -13,7 +13,7 @@
 
 (define (try-canonicalize-path x)
   (with-handler (lambda (err)
-                  (displayln "Failed canonicalizing path: " x err)
+                  (log::info! "Failed canonicalizing path: " x err)
                   #f)
                 (canonicalize-path x)))
 
@@ -55,12 +55,12 @@
       (car paths)
       #f))
 
-(define (loop-events events)
+(define (loop-events events [delay-ms 2000])
   (define next-event (receive-event! events))
   (with-handler
    (lambda (err)
-     (displayln err)
-     (loop-events events))
+     (log::info! err)
+     (loop-events events delay-ms))
    (define paths (map try-canonicalize-path (event-paths next-event)))
    (define open-buffers (map try-canonicalize-path (hx.block-on-task (lambda () (all-open-files)))))
    ;; Lots of allocation!
@@ -74,7 +74,7 @@
         ;; Give helix like, 5 seconds to make an edit before deciding to update
         ;; Enqueue a callback with a delay, without blocking the thread.
         (enqueue-thread-local-callback-with-delay
-         2000
+         delay-ms
          (lambda ()
            ;; Save where we are, jump in to each of these, call the function.
            (temporarily-switch-focus
@@ -87,11 +87,23 @@
                               (begin
                                 (open-or-switch-focus (path->doc-id x))
                                 (maybe-reload x))))
-                        ; ))
                         intersection))))))))
-   (loop-events events)))
+   (loop-events events delay-ms)))
 
-(define (spawn-watcher [path "."])
+(define *registered-watcher* #f)
+
+;;@doc
+;; Spawn a file watcher which will reload
+(define (spawn-watcher [path #f] [delay-ms 2000])
   (spawn-native-thread (lambda ()
-                         (define events (watch-files path))
-                         (loop-events events))))
+                         (define events
+                           (if path
+                               (watch-files path)
+                               (make-empty-watcher)))
+                         ;; Make it so that we can fuss with subscribing to files later
+                         (set! *registered-watcher* events)
+                         (loop-events events delay-ms)))
+
+  (define currently-opened-files (all-open-files))
+
+  (for-each (lambda (x) (watch-file! *registered-watcher* x)) currently-opened-files))

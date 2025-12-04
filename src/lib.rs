@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Mutex,
         mpsc::{Receiver, RecvError, Sender},
@@ -23,7 +23,10 @@ fn file_watcher_module() -> FFIModule {
         .register_fn("watch-files", watch_files)
         .register_fn("receive-event!", EventReceiver::recv)
         .register_fn("event-paths", NotifyEvent::paths)
-        .register_fn("event-kind", NotifyEvent::kind);
+        .register_fn("event-kind", NotifyEvent::kind)
+        .register_fn("make-empty-watcher", spawn_empty_watcher)
+        .register_fn("watch-file!", EventReceiver::watch_file)
+        .register_fn("unwatch-file!", EventReceiver::unwatch_file);
 
     module
 }
@@ -53,6 +56,16 @@ impl EventReceiver {
             Err(err) => RResult::RErr(err),
         }
     }
+
+    fn watch_file(&mut self, path: &str) {
+        self._watcher
+            .watch(&PathBuf::from(path), RecursiveMode::NonRecursive)
+            .ok();
+    }
+
+    fn unwatch_file(&mut self, path: &str) {
+        self._watcher.unwatch(&PathBuf::from(path)).ok();
+    }
 }
 
 impl NotifyEvent {
@@ -75,6 +88,26 @@ impl NotifyEvent {
             .map(|x| FFIValue::StringV(RString::from(x.as_os_str().to_str().unwrap())))
             .collect()
     }
+}
+
+fn spawn_empty_watcher() -> FFIValue {
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    let watcher = notify::recommended_watcher(move |event: Result<Event, _>| {
+        if let Ok(event) = event {
+            if let notify::EventKind::Modify(_) = &event.kind {
+                sender.send(event).unwrap();
+            }
+        }
+    })
+    .unwrap();
+
+    EventReceiver {
+        _watcher: watcher,
+        receiver: Mutex::new(receiver),
+    }
+    .into_ffi_val()
+    .unwrap()
 }
 
 fn watch_files(path: String) -> FFIValue {
