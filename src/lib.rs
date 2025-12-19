@@ -1,47 +1,40 @@
-use std::{
-    error::Error,
-    path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        mpsc::{Receiver, RecvError, Sender},
-    },
-};
+use std::collections::HashSet;
+use std::mem;
+use std::path::absolute;
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+use std::{path::PathBuf, sync::mpsc::Receiver};
 
 use abi_stable::std_types::{RBoxError, RResult, RString, RVec};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use steel::{
-    rvals::Custom,
-    steel_vm::ffi::{FFIModule, FFIValue, IntoFFIVal, RegisterFFIFn},
-};
+use notify::{Event, PollWatcher, RecursiveMode, Watcher as _};
+use steel::rvals::Custom;
+use steel::steel_vm::ffi::{FFIModule, FFIValue, IntoFFIVal, RegisterFFIFn};
 
 steel::declare_module!(build_module);
 
 fn file_watcher_module() -> FFIModule {
     let mut module = FFIModule::new("steel/file-watcher");
-
     module
-        .register_fn("watch-files", watch_files)
-        .register_fn("receive-event!", EventReceiver::recv)
+        .register_fn("receive-event!", || WATCHER.recv())
+        .register_fn("set-watch-files", |files| WATCHER.set_watch_files(files))
         .register_fn("event-paths", NotifyEvent::paths)
-        .register_fn("event-kind", NotifyEvent::kind)
-        .register_fn("make-empty-watcher", spawn_empty_watcher)
-        .register_fn("watch-file!", EventReceiver::watch_file)
-        .register_fn("unwatch-file!", EventReceiver::unwatch_file);
-
+        .register_fn("event-kind", NotifyEvent::kind);
     module
 }
 
-struct EventReceiver {
-    _watcher: RecommendedWatcher,
+struct Watcher {
+    watcher: Mutex<PollWatcher>,
+    files: Mutex<HashSet<String>>,
     receiver: Mutex<Receiver<Event>>,
 }
+
 struct NotifyEvent(Event);
 
-impl Custom for EventReceiver {}
+impl Custom for Watcher {}
 impl Custom for NotifyEvent {}
 
-impl EventReceiver {
-    fn recv(&mut self) -> RResult<FFIValue, RBoxError> {
+impl Watcher {
+    fn recv(&self) -> RResult<FFIValue, RBoxError> {
         let res = self
             .receiver
             .lock()
@@ -49,7 +42,7 @@ impl EventReceiver {
             .recv()
             .map(NotifyEvent)
             .map(|x| x.into_ffi_val().unwrap())
-            .map_err(|x| RBoxError::new(x));
+            .map_err(RBoxError::new);
 
         match res {
             Ok(ok) => RResult::ROk(ok),
@@ -57,26 +50,28 @@ impl EventReceiver {
         }
     }
 
-    fn watch_file(&mut self, path: &str) {
-        self._watcher
-            .watch(&PathBuf::from(path), RecursiveMode::NonRecursive)
-            .ok();
-    }
+    fn set_watch_files(&self, files: Vec<String>) {
+        let new_set: HashSet<_> = files.into_iter().map(|s| s.to_string()).collect();
+        let old_set = mem::replace(&mut *self.files.lock().unwrap(), new_set.clone());
 
-    fn unwatch_file(&mut self, path: &str) {
-        self._watcher.unwatch(&PathBuf::from(path)).ok();
+        let mut watcher = self.watcher.lock().unwrap();
+        for new_path in new_set.difference(&old_set) {
+            let path = PathBuf::from(new_path);
+            let abs_path = absolute(&path).unwrap();
+            _ = watcher.watch(&abs_path, RecursiveMode::NonRecursive);
+        }
+        for old_path in old_set.difference(&new_set) {
+            let path_buf = PathBuf::from(old_path);
+            let abs_path = absolute(&path_buf).unwrap();
+            _ = watcher.unwatch(&abs_path);
+        }
     }
 }
 
 impl NotifyEvent {
     pub fn kind(&self) -> FFIValue {
         match self.0.kind {
-            // notify::EventKind::Any => todo!(),
-            // notify::EventKind::Access(access_kind) => todo!(),
-            // notify::EventKind::Create(create_kind) => todo!(),
-            notify::EventKind::Modify(_) => FFIValue::StringV(RString::from("modified")),
-            // notify::EventKind::Remove(remove_kind) => todo!(),
-            // notify::EventKind::Other => todo!(),
+            notify::EventKind::Modify(_) => "modify".to_owned().into_ffi_val().unwrap(),
             _ => FFIValue::BoolV(false),
         }
     }
@@ -90,49 +85,26 @@ impl NotifyEvent {
     }
 }
 
-fn spawn_empty_watcher() -> FFIValue {
+static WATCHER: LazyLock<Watcher> = LazyLock::new(|| {
     let (sender, receiver) = std::sync::mpsc::channel();
-
-    let watcher = notify::recommended_watcher(move |event: Result<Event, _>| {
-        if let Ok(event) = event {
-            if let notify::EventKind::Modify(_) = &event.kind {
-                sender.send(event).unwrap();
-            }
-        }
-    })
+    let watcher = notify::PollWatcher::new(
+        move |event: Result<Event, _>| {
+            let Ok(event) = event else { return };
+            let notify::EventKind::Modify(_) = &event.kind else {
+                return;
+            };
+            sender.send(event).unwrap();
+        },
+        notify::Config::default().with_poll_interval(Duration::from_secs(5)),
+    )
     .unwrap();
 
-    EventReceiver {
-        _watcher: watcher,
+    Watcher {
+        watcher: Mutex::new(watcher),
+        files: Mutex::default(),
         receiver: Mutex::new(receiver),
     }
-    .into_ffi_val()
-    .unwrap()
-}
-
-fn watch_files(path: String) -> FFIValue {
-    let (sender, receiver) = std::sync::mpsc::channel();
-
-    let mut watcher = notify::recommended_watcher(move |event: Result<Event, _>| {
-        if let Ok(event) = event {
-            if let notify::EventKind::Modify(_) = &event.kind {
-                sender.send(event).unwrap();
-            }
-        }
-    })
-    .unwrap();
-
-    let path = PathBuf::from(path.clone());
-
-    watcher.watch(&path, RecursiveMode::Recursive).unwrap();
-
-    EventReceiver {
-        _watcher: watcher,
-        receiver: Mutex::new(receiver),
-    }
-    .into_ffi_val()
-    .unwrap()
-}
+});
 
 pub fn build_module() -> FFIModule {
     file_watcher_module()

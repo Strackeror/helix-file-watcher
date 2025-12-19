@@ -9,101 +9,77 @@
 (provide spawn-watcher)
 
 (define (all-open-files)
-  (map editor-document->path (editor-all-documents)))
+  (~>> (editor-all-documents)
+    (map editor-document->path)
+    (filter id)
+    (map try-canonicalize-path)
+    (filter id)))
 
 (define (try-canonicalize-path x)
   (with-handler (lambda (err)
-                  (log::info! "Failed canonicalizing path: " x err)
-                  #f)
-                (canonicalize-path x)))
-
-(define (open-file-if-not-already-open x)
-  (unless (equal? x (~> (editor-focus) editor->doc-id editor-document->path))
-    (helix.open x)))
-
-(define (temporarily-switch-focus thunk)
-  (define last-focused (editor-focus))
-  (define last-mode (editor-mode))
-  (thunk)
-  (editor-set-focus! last-focused)
-  (editor-set-mode! last-mode))
-
-(define (open-or-switch-focus document-id)
-  (define maybe-view-id? (editor-doc-in-view? document-id))
-  (if maybe-view-id?
-      (editor-set-focus! maybe-view-id?)
-      (editor-switch! document-id)))
-
-(define (maybe-reload x [thunk #f])
-  (define helix-doc-last-saved (~> (editor-focus) editor->doc-id editor-document-last-saved))
-  ;; If the helix las
-  (define file-last-modified (fs-metadata-modified (file-metadata x)))
-  (define now (system-time/now))
-
-  ;; Racing helix... no good
-  (when (system-time<? helix-doc-last-saved file-last-modified)
-    (helix.reload)
-
-    (when thunk
-      (thunk))))
+                 (log::info! (to-string "Failed canonicalizing path: " x err))
+                 #f)
+    (canonicalize-path x)))
 
 (define (path->doc-id path)
   (define paths
     (filter (lambda (doc-id) (equal? (editor-document->path doc-id) path)) (editor-all-documents)))
 
   (if (= (length paths) 1)
-      (car paths)
-      #f))
+    (car paths)
+    #f))
 
-(define (loop-events events [delay-ms 2000])
-  (define next-event (receive-event! events))
+;; reload file only if the write time isn't the same as it is for helix
+(define (maybe-reload x [thunk #f])
+  (define doc-id (path->doc-id x))
+  (define helix-doc-last-saved (editor-document-last-saved doc-id))
+  (define file-last-modified (fs-metadata-modified (file-metadata x)))
+  (define now (system-time/now))
+
+  ;; Racing helix... no good
+  (when (system-time<? helix-doc-last-saved file-last-modified)
+    (log::info! (to-string "reloading file: " x))
+    (editor-document-reload doc-id)
+    (when thunk (thunk))))
+
+(define (loop-events delay-ms)
+  (define next-event (receive-event!))
   (with-handler
-   (lambda (err)
-     (log::info! err)
-     (loop-events events delay-ms))
-   (define paths (map try-canonicalize-path (event-paths next-event)))
-   (define open-buffers (map try-canonicalize-path (hx.block-on-task (lambda () (all-open-files)))))
-   ;; Lots of allocation!
-   (define intersection
-     (filter (lambda (x) x)
-             (hashset->list (hashset-intersection (list->hashset paths)
-                                                  (list->hashset open-buffers)))))
-   (unless (empty? intersection)
-     (hx.with-context
-      (lambda ()
-        ;; Give helix like, 5 seconds to make an edit before deciding to update
-        ;; Enqueue a callback with a delay, without blocking the thread.
-        (enqueue-thread-local-callback-with-delay
-         delay-ms
-         (lambda ()
-           ;; Save where we are, jump in to each of these, call the function.
-           (temporarily-switch-focus
-            (lambda ()
-              (for-each (lambda (x)
-                          ;; Switch to the file, and reload it only if the write time isn't the same
-                          ;; as it is for helix
-                          (if (equal? x (~> (editor-focus) editor->doc-id editor-document->path))
-                              (maybe-reload x)
-                              (begin
-                                (open-or-switch-focus (path->doc-id x))
-                                (maybe-reload x))))
-                        intersection))))))))
-   (loop-events events delay-ms)))
+    (lambda (err)
+      (log::info! (to-string "err" err))
+      (loop-events delay-ms))
+    (define paths (map try-canonicalize-path (event-paths next-event)))
+    (define open-buffers (map try-canonicalize-path (hx.block-on-task (lambda () (all-open-files)))))
+    ;; Lots of allocation!
+    (define intersection
+      (filter (lambda (x) x)
+        (hashset->list (hashset-intersection
+                        (list->hashset paths)
+                        (list->hashset open-buffers)))))
+    (unless (empty? intersection)
+      (hx.with-context
+        (lambda ()
+          ;; Give helix like, 5 seconds to make an edit before deciding to update
+          ;; Enqueue a callback with a delay, without blocking the thread.
+          (enqueue-thread-local-callback-with-delay
+            delay-ms
+            (lambda () (for-each maybe-reload intersection))))))
 
-(define *registered-watcher* #f)
+    (loop-events delay-ms)))
+
+(define *started* #f)
+
+(register-hook! 'document-opened
+  (lambda (_)
+    (when *started*
+      (set-watch-files (all-open-files)))))
 
 ;;@doc
 ;; Spawn a file watcher which will reload
-(define (spawn-watcher [path #f] [delay-ms 2000])
+(define (spawn-watcher [delay-ms 2000])
+  (log::info! (to-string "setting initial watched files"))
+  (set-watch-files (all-open-files))
   (spawn-native-thread (lambda ()
-                         (define events
-                           (if path
-                               (watch-files path)
-                               (make-empty-watcher)))
-                         ;; Make it so that we can fuss with subscribing to files later
-                         (set! *registered-watcher* events)
-                         (loop-events events delay-ms)))
-
-  (define currently-opened-files (all-open-files))
-
-  (for-each (lambda (x) (watch-file! *registered-watcher* x)) currently-opened-files))
+                        (set! *started* #t)
+                        (log::info! "starting event loop")
+                        (loop-events delay-ms))))
