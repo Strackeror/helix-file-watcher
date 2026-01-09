@@ -67,11 +67,11 @@
 
     (loop-events delay-ms)))
 
-(define *started* #f)
+(define *started* (box #f))
 
 (register-hook! 'document-opened
   (lambda (_)
-    (when *started*
+    (when (unbox *started*)
       (set-watch-files (all-open-files)))))
 
 ;;@doc
@@ -80,6 +80,6 @@
   (log::info! (to-string "setting initial watched files"))
   (set-watch-files (all-open-files))
   (spawn-native-thread (lambda ()
-                        (set! *started* #t)
+                        (set-box! *started* #t)
                         (log::info! "starting event loop")
                         (loop-events delay-ms))))
